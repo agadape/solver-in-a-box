@@ -312,23 +312,30 @@ async def amain() -> None:
         asyncio.create_task(listen_orders(cfg, client, executor, stats)),
         asyncio.create_task(stop.wait()),
     ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-
-    console.print(
-        f"\n[bold]Session summary[/bold]  orders={stats.orders_seen}  "
-        f"filled=[green]{stats.fills_ok}[/green]  "
-        f"skipped=[dim]{stats.skipped}[/dim]  "
-        f"failed=[red]{stats.fills_failed}[/red]  "
-        f"PnL=[yellow]{stats.pnl_usdc:.4f} USDC[/yellow]"
-    )
-    await client.close()
-    log.info("shutdown clean")
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        for t in tasks:
+            t.cancel()
+    finally:
+        console.print(
+            f"\n[bold]Session summary[/bold]  orders={stats.orders_seen}  "
+            f"filled=[green]{stats.fills_ok}[/green]  "
+            f"skipped=[dim]{stats.skipped}[/dim]  "
+            f"failed=[red]{stats.fills_failed}[/red]  "
+            f"PnL=[yellow]{stats.pnl_usdc:.4f} USDC[/yellow]"
+        )
+        await client.close()
+        log.info("shutdown clean")
 
 
 def main() -> None:
-    asyncio.run(amain())
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

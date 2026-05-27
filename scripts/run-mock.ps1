@@ -13,6 +13,7 @@ if (-not (Test-Path ".venv")) {
 & .\.venv\Scripts\Activate.ps1
 
 $env:MODE = "mock"
+$env:PYTHONUTF8 = "1"
 
 Write-Host "Starting mock server on http://127.0.0.1:8000 ..." -ForegroundColor Cyan
 $mock = Start-Process -PassThru -NoNewWindow `

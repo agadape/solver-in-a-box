@@ -26,6 +26,8 @@ app = FastAPI(title="lifi-intents-mock")
 
 _state: dict[str, Any] = {"quotes": [], "registered": False}
 _ws_clients: set[WebSocket] = set()
+_order_queue: list[dict] = []
+_ORDER_QUEUE_MAX = 20
 
 MOCK_INTERVAL = int(os.getenv("MOCK_INTERVAL_SECONDS", "15"))
 MOCK_SIZE = int(os.getenv("MOCK_ORDER_SIZE_USDC", "50"))
@@ -56,6 +58,12 @@ async def submit_quotes(req: Request) -> dict:
 @app.get("/solver-api/quotes")
 async def get_quotes() -> list[dict]:
     return _state["quotes"]
+
+
+@app.get("/orders")
+async def get_orders() -> dict:
+    """HTTP polling fallback — returns last N synthetic orders."""
+    return {"orders": _order_queue}
 
 
 @app.get("/chains/supported")
@@ -109,9 +117,17 @@ def _synthetic_order() -> dict:
 async def _push_loop() -> None:
     while True:
         await asyncio.sleep(MOCK_INTERVAL)
-        if not _ws_clients:
-            continue
         order = _synthetic_order()
+
+        _order_queue.append(order)
+        if len(_order_queue) > _ORDER_QUEUE_MAX:
+            _order_queue.pop(0)
+
+        if not _ws_clients:
+            log.info("▶ queued %s (%.2f USDC, no WS clients)",
+                     order["orderId"][:18], MOCK_SIZE)
+            continue
+
         msg = json.dumps({"event": "order.signed", "order": order})
         dead: list[WebSocket] = []
         for ws in _ws_clients:
@@ -121,7 +137,7 @@ async def _push_loop() -> None:
                 dead.append(ws)
         for ws in dead:
             _ws_clients.discard(ws)
-        log.info("▶ pushed %s (%.2f USDC, %d clients)",
+        log.info("▶ pushed %s (%.2f USDC, %d WS clients)",
                  order["orderId"][:18], MOCK_SIZE, len(_ws_clients))
 
 

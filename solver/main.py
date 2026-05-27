@@ -10,6 +10,7 @@ Read top-to-bottom; no framework magic.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import signal
@@ -18,10 +19,27 @@ from decimal import Decimal
 from typing import Any
 
 import websockets
+from rich.align import Align
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
 
 from solver import config as cfg_mod
 from solver.api_client import OrderServerClient
 from solver.chain import ChainExecutor, sign_registration
+
+
+console = Console(legacy_windows=False)
+
+# ---------- stats ----------
+
+@dataclasses.dataclass
+class Stats:
+    orders_seen: int = 0
+    skipped: int = 0
+    fills_ok: int = 0
+    fills_failed: int = 0
+    pnl_usdc: Decimal = dataclasses.field(default_factory=Decimal)
 
 
 # ---------- logging ----------
@@ -29,8 +47,9 @@ from solver.chain import ChainExecutor, sign_registration
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(message)s",
+        datefmt="[%H:%M:%S]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True, markup=True)],
     )
 
 
@@ -47,7 +66,7 @@ async def register(client: OrderServerClient, cfg: cfg_mod.Config) -> None:
     sig = sign_registration(cfg.solver_pk, cfg.solver_address, ts)
     log.info("registering solver %s ...", cfg.solver_address)
     await client.register_account(cfg.solver_address, sig)
-    log.info("  ✓ registered")
+    log.info("  OK registered")
 
 
 # ---------- quote curve ----------
@@ -95,16 +114,16 @@ async def quote_loop(client: OrderServerClient, cfg: cfg_mod.Config) -> None:
     while True:
         curve = build_curve(cfg)
         log.info(
-            "posting curve %s->%s spread=%dbps",
+            "posting curve %s->%s spread=[magenta]%dbps[/magenta]",
             cfg.route.src_chain_id,
             cfg.route.dst_chain_id,
             cfg.spread_bps,
         )
         try:
             await client.submit_quotes([curve])
-            log.info("  ✓ curve accepted")
+            log.info("  [green]OK curve accepted[/green]")
         except Exception as exc:  # noqa: BLE001
-            log.warning("  ✗ submit_quotes failed: %s", exc)
+            log.warning("  [red]!! submit_quotes failed:[/red] %s", exc)
         await asyncio.sleep(cfg.refresh_seconds)
 
 
@@ -128,46 +147,26 @@ def evaluate(order: dict, cfg: cfg_mod.Config) -> tuple[bool, str]:
     return True, "match"
 
 
-# ---------- order listener ----------
+# ---------- order processing ----------
 
-async def listen_orders(
+async def _process_order(
+    order: dict,
     cfg: cfg_mod.Config,
-    client: OrderServerClient,
     executor: ChainExecutor,
+    stats: Stats,
 ) -> None:
-    backoff = 1
-    while True:
-        try:
-            async with websockets.connect(cfg.server_ws) as ws:
-                log.info("WS connected -> %s", cfg.server_ws)
-                backoff = 1
-                async for raw in ws:
-                    asyncio.create_task(_handle_message(raw, cfg, executor))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("WS dropped (%s); reconnect in %ds", exc, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-
-async def _handle_message(
-    raw: str, cfg: cfg_mod.Config, executor: ChainExecutor
-) -> None:
-    try:
-        msg = json.loads(raw)
-    except json.JSONDecodeError:
-        log.warning("malformed WS message, skipping")
-        return
-
-    order = msg.get("order", msg)
     order_id = order.get("orderId") or order.get("onChainOrderId", "?")
-    log.info("◀ order %s", order_id)
+    short_id = order_id[:20] + "..."
+    stats.orders_seen += 1
+    console.log(f"[cyan]<< order[/cyan] {short_id}")
 
     ok, reason = evaluate(order, cfg)
     if not ok:
-        log.info("  skip: %s", reason)
+        stats.skipped += 1
+        console.log(f"  [dim]skip: {reason}[/dim]")
         return
 
-    log.info("  ✓ evaluate=fill, executing...")
+    console.log("  [green]OK evaluate=fill[/green], executing...")
     try:
         fill_tx = await executor.fill_order(
             output_settler=cfg.output_settler_dst,
@@ -175,16 +174,103 @@ async def _handle_message(
             order_id=order_id,
             outputs=order.get("outputs", []),
         )
-        log.info("  ✓ fill tx %s", fill_tx)
-
         fin_tx = await executor.finalise_source(
             input_settler=cfg.input_settler_src,
             order=order,
             attestation=b"",
         )
-        log.info("[SETTLED] order=%s fill=%s finalise=%s", order_id, fill_tx, fin_tx)
+
+        try:
+            in_amt = Decimal(order["inputs"][0][1])
+            out_amt = Decimal(order["outputs"][0]["amount"])
+            pnl = (in_amt - out_amt) / Decimal(10 ** cfg.route.src_decimals)
+            stats.pnl_usdc += pnl
+        except Exception:
+            pnl = Decimal(0)
+
+        stats.fills_ok += 1
+        console.print(
+            f"[bold green][SETTLED][/bold green] {short_id} "
+            f"fill={fill_tx} fin={fin_tx} "
+            f"[yellow]+{pnl:.4f} USDC[/yellow]  |  "
+            f"[bold]total PnL: {stats.pnl_usdc:.4f} USDC[/bold]  "
+            f"fills={stats.fills_ok} skipped={stats.skipped}"
+        )
     except Exception as exc:  # noqa: BLE001
-        log.error("  ✗ execution failed: %s", exc)
+        stats.fills_failed += 1
+        console.log(f"  [red]!! execution failed:[/red] {exc}")
+
+
+async def _handle_message(
+    raw: str,
+    cfg: cfg_mod.Config,
+    executor: ChainExecutor,
+    stats: Stats,
+) -> None:
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("malformed WS message, skipping")
+        return
+    order = msg.get("order", msg)
+    await _process_order(order, cfg, executor, stats)
+
+
+# ---------- order listener (WS + HTTP fallback) ----------
+
+_WS_FAIL_THRESHOLD = 3
+_POLL_INTERVAL_SECONDS = 5
+
+
+async def listen_orders(
+    cfg: cfg_mod.Config,
+    client: OrderServerClient,
+    executor: ChainExecutor,
+    stats: Stats,
+) -> None:
+    backoff = 1
+    ws_failures = 0
+    seen_ids: set[str] = set()
+
+    while True:
+        if ws_failures < _WS_FAIL_THRESHOLD:
+            try:
+                async with websockets.connect(cfg.server_ws) as ws:
+                    console.log(f"[green]WS connected[/green] -> {cfg.server_ws}")
+                    backoff = 1
+                    ws_failures = 0
+                    async for raw in ws:
+                        asyncio.create_task(
+                            _handle_message(raw, cfg, executor, stats)
+                        )
+            except Exception as exc:  # noqa: BLE001
+                ws_failures += 1
+                console.log(
+                    f"[yellow]WS dropped[/yellow] ({exc}); "
+                    f"reconnect in {backoff}s [{ws_failures}/{_WS_FAIL_THRESHOLD}]"
+                )
+                if ws_failures >= _WS_FAIL_THRESHOLD:
+                    console.log(
+                        "[yellow]WS unavailable — switching to HTTP polling "
+                        f"(every {_POLL_INTERVAL_SECONDS}s)[/yellow]"
+                    )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+        else:
+            # HTTP polling fallback
+            try:
+                result = await client.get_orders()
+                orders = result if isinstance(result, list) else result.get("orders", [])
+                for order in orders:
+                    oid = order.get("orderId") or order.get("onChainOrderId", "?")
+                    if oid not in seen_ids:
+                        seen_ids.add(oid)
+                        asyncio.create_task(
+                            _process_order(order, cfg, executor, stats)
+                        )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("HTTP poll failed: %s", exc)
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 
 # ---------- entry ----------
@@ -192,8 +278,19 @@ async def _handle_message(
 async def amain() -> None:
     cfg = cfg_mod.load()
     _setup_logging(cfg.log_level)
-    log.info("solver-in-a-box starting (mode=%s)", cfg.mode)
 
+    console.print(Panel(
+        Align.center(
+            f"[bold cyan]solver-in-a-box[/bold cyan]\n"
+            f"mode=[green]{cfg.mode}[/green]  "
+            f"route=[yellow]{cfg.route.src_chain_id} -> {cfg.route.dst_chain_id}[/yellow]  "
+            f"spread=[magenta]{cfg.spread_bps} bps[/magenta]"
+        ),
+        title="[bold]LI.FI Intents Solver[/bold]",
+        border_style="cyan",
+    ))
+
+    stats = Stats()
     client = OrderServerClient(cfg.server_url, cfg.api_key)
     executor = ChainExecutor(
         cfg.src_rpc, cfg.dst_rpc, cfg.solver_pk, cfg.solver_address,
@@ -212,12 +309,20 @@ async def amain() -> None:
 
     tasks = [
         asyncio.create_task(quote_loop(client, cfg)),
-        asyncio.create_task(listen_orders(cfg, client, executor)),
+        asyncio.create_task(listen_orders(cfg, client, executor, stats)),
         asyncio.create_task(stop.wait()),
     ]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
+
+    console.print(
+        f"\n[bold]Session summary[/bold]  orders={stats.orders_seen}  "
+        f"filled=[green]{stats.fills_ok}[/green]  "
+        f"skipped=[dim]{stats.skipped}[/dim]  "
+        f"failed=[red]{stats.fills_failed}[/red]  "
+        f"PnL=[yellow]{stats.pnl_usdc:.4f} USDC[/yellow]"
+    )
     await client.close()
     log.info("shutdown clean")
 

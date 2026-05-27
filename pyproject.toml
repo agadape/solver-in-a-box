@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "pydantic>=2.8.0",
     "eth-account>=0.13.0",
+    "rich>=13.0",
 ]
 
 [project.optional-dependencies]

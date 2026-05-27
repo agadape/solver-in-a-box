@@ -32,7 +32,7 @@ No API key, no testnet faucet, no internet required.
 
 **Linux / macOS:**
 ```bash
-git clone <this-repo> solver-in-a-box
+git clone https://github.com/agadape/solver-in-a-box
 cd solver-in-a-box
 cp .env.example .env
 make install          # creates venv, installs deps
@@ -41,7 +41,7 @@ make run-mock         # starts mock server + solver
 
 **Windows / PowerShell:**
 ```powershell
-git clone <this-repo> solver-in-a-box
+git clone https://github.com/agadape/solver-in-a-box
 cd solver-in-a-box
 copy .env.example .env
 scripts\install.ps1

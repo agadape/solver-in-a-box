@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -v
+
+      - name: Mock smoke test
+        run: |
+          uvicorn mock_server.main:app --host 127.0.0.1 --port 8000 &
+          MOCK_PID=$!
+          sleep 2
+          MODE=mock MOCK_INTERVAL_SECONDS=3 timeout 20 python -m solver.main 2>&1 | tee solver.log || true
+          kill $MOCK_PID 2>/dev/null || true
+          grep -q "\[SETTLED\]" solver.log || (echo "no SETTLED line found"; exit 1)
